@@ -3,17 +3,19 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 import ctypes as ct
+import itertools
 import operator
 import random
 import torch
 import itertools
 import math
 
+from functools import reduce  # Required in Python 3
 from typing import Tuple
 from torch import Tensor
 
 from .cextension import COMPILED_WITH_CUDA, lib
-from functools import reduce  # Required in Python 3
+
 
 # math.prod not compatible with python < 3.8
 def prod(iterable):
@@ -32,6 +34,10 @@ if COMPILED_WITH_CUDA:
     str2optimizer32bit["rmsprop"] = (
         lib.crmsprop32bit_g32,
         lib.crmsprop32bit_g16,
+    )
+    str2optimizer32bit["lion"] = (
+        lib.clion32bit_g32,
+        lib.clion32bit_g16,
     )
     str2optimizer32bit["adagrad"] = (
         lib.cadagrad32bit_g32,
@@ -56,6 +62,10 @@ if COMPILED_WITH_CUDA:
         lib.crmsprop_static_8bit_g32,
         lib.crmsprop_static_8bit_g16,
     )
+    str2optimizer8bit["lion"] = (
+        lib.clion_static_8bit_g32,
+        lib.clion_static_8bit_g16,
+    )
     str2optimizer8bit["lamb"] = (
         lib.cadam_static_8bit_g32,
         lib.cadam_static_8bit_g16,
@@ -78,13 +88,17 @@ if COMPILED_WITH_CUDA:
         lib.crmsprop_8bit_blockwise_fp32,
         lib.crmsprop_8bit_blockwise_fp16,
     )
+    str2optimizer8bit_blockwise["lion"] = (
+        lib.clion_8bit_blockwise_fp32,
+        lib.clion_8bit_blockwise_fp16,
+    )
     str2optimizer8bit_blockwise["adagrad"] = (
         lib.cadagrad_8bit_blockwise_fp32,
         lib.cadagrad_8bit_blockwise_fp16,
     )
 
 
-class CUBLAS_Context(object):
+class CUBLAS_Context:
     _instance = None
 
     def __init__(self):
@@ -114,7 +128,7 @@ class CUBLAS_Context(object):
         return self.context[device.index]
 
 
-class Cusparse_Context(object):
+class Cusparse_Context:
     _instance = None
 
     def __init__(self):
@@ -166,7 +180,7 @@ def create_fp8_map(signed=True, exponent_bits=5, precision_bits=2, total_bits=8)
     values = []
     lst = list(itertools.product([0, 1], repeat=precision_bits))
     #for ev in evalues:
-    bias = 2**(exponent_bits-1)-1
+    bias = 2**(exponent_bits-1)
     for evalue in range(2**(exponent_bits)):
         for bit_pattern in lst:
             value = (1 if evalue != 0 else 0)
@@ -174,10 +188,10 @@ def create_fp8_map(signed=True, exponent_bits=5, precision_bits=2, total_bits=8)
                 value += pval*(2**-(i+1))
             if evalue == 0:
                 # subnormals
-                value = value*2**-(bias-1)
+                value = value*2**-(bias)
             else:
                 # normals
-                value = value*2**-(evalue-bias-2)
+                value = value*2**-(evalue-bias-1)
             values.append(value)
             if signed:
                 values.append(-value)
@@ -264,13 +278,12 @@ def create_quantile_map(A, total_bits=8):
 
 def get_special_format_str():
     if not torch.cuda.is_available(): return 'col_turing'
-    major, minor = torch.cuda.get_device_capability()
+    major, _minor = torch.cuda.get_device_capability()
     if major <= 7:
         return "col_turing"
-    elif major == 8:
+    if major == 8:
         return "col_ampere"
-    else:
-        return "col_turing"
+    return "col_turing"
 
 
 
@@ -397,8 +410,6 @@ def nvidia_transform(
         dim2 = ct.c_int32(shape[2])
 
     ptr = CUBLAS_Context.get_instance().get_context(A.device)
-    ptrA = get_ptr(A)
-    ptrOut = get_ptr(out)
     func(ptr, get_ptr(A), get_ptr(out), dim1, dim2)
 
     return out, new_state
@@ -509,13 +520,12 @@ def quantize_blockwise(A: Tensor, code: Tensor = None, absmax: Tensor = None, ra
         code = code.to(A.device)
         if rand is not None:
             is_on_gpu([code, A, out, absmax, rand])
-            assert blocksize==4096
             assert rand.numel() >= 1024
             rand_offset = random.randint(0, 1023)
             if A.dtype == torch.float32:
-                lib.cquantize_blockwise_stochastic_fp32(get_ptr(code), get_ptr(A),get_ptr(absmax), get_ptr(out), get_ptr(rand), ct.c_int32(rand_offset), ct.c_int(A.numel()))
+                lib.cquantize_blockwise_stochastic_fp32(get_ptr(code), get_ptr(A),get_ptr(absmax), get_ptr(out), get_ptr(rand), ct.c_int32(rand_offset), cblocksize, ct.c_int(A.numel()))
             elif A.dtype == torch.float16:
-                lib.cquantize_blockwise_stochastic_fp16(get_ptr(code), get_ptr(A),get_ptr(absmax), get_ptr(out), get_ptr(rand), ct.c_int32(rand_offset), ct.c_int(A.numel()))
+                lib.cquantize_blockwise_stochastic_fp16(get_ptr(code), get_ptr(A),get_ptr(absmax), get_ptr(out), get_ptr(rand), ct.c_int32(rand_offset), cblocksize, ct.c_int(A.numel()))
             else:
                 raise ValueError(f"Blockwise quantization only supports 16/32-bit floats, but got {A.dtype}")
         else:
@@ -657,9 +667,11 @@ def quantize_no_absmax(A: Tensor, code: Tensor, out: Tensor = None) -> Tensor:
     torch.Tensor:
         Quantized 8-bit tensor.
     '''
+    prev_device = pre_call(A.device)
     if out is None: out = torch.zeros_like(A, dtype=torch.uint8)
     is_on_gpu([A, out])
     lib.cquantize(get_ptr(code), get_ptr(A), get_ptr(out), ct.c_int(A.numel()))
+    post_call(prev_device)
     return out
 
 
@@ -684,9 +696,11 @@ def dequantize_no_absmax(A: Tensor, code: Tensor, out: Tensor = None) -> Tensor:
     torch.Tensor:
         32-bit output tensor.
     '''
+    prev_device = pre_call(A.device)
     if out is None: out = torch.zeros_like(A, dtype=torch.float32)
     is_on_gpu([code, A, out])
     lib.cdequantize(get_ptr(code), get_ptr(A), get_ptr(out), ct.c_int(A.numel()))
+    post_call(prev_device)
     return out
 
 
@@ -755,6 +769,8 @@ def optimizer_update_32bit(
             f'Optimizer not implemented: {optimizer_name}. Choices: {",".join(str2optimizer32bit.keys())}'
         )
 
+    prev_device = pre_call(g.device)
+    is_on_gpu([g, p, state1, state2, unorm_vec])
     if g.dtype == torch.float32 and state1.dtype == torch.float32:
         str2optimizer32bit[optimizer_name][0](
             get_ptr(g),
@@ -797,6 +813,7 @@ def optimizer_update_32bit(
         raise ValueError(
             f"Gradient+optimizer bit data type combination not supported: grad {g.dtype}, optimizer {state1.dtype}"
         )
+    post_call(prev_device)
 
 
 def optimizer_update_8bit(
@@ -875,6 +892,8 @@ def optimizer_update_8bit(
     if max_unorm > 0.0:
         param_norm = torch.norm(p.data.float())
 
+    prev_device = pre_call(g.device)
+    is_on_gpu([g, p, state1, state2, unorm_vec, qmap1, qmap2, max1, max2, new_max1, new_max2])
     if g.dtype == torch.float32 and state1.dtype == torch.uint8:
         str2optimizer8bit[optimizer_name][0](
             get_ptr(p),
@@ -927,6 +946,7 @@ def optimizer_update_8bit(
         raise ValueError(
             f"Gradient+optimizer bit data type combination not supported: grad {g.dtype}, optimizer {state1.dtype}"
         )
+    post_call(prev_device)
 
 
 def optimizer_update_8bit_blockwise(
@@ -949,6 +969,8 @@ def optimizer_update_8bit_blockwise(
     skip_zeros=False,
 ) -> None:
 
+    prev_device = pre_call(g.device)
+    is_on_gpu([g, p, state1, state2, qmap1, qmap2, absmax1, absmax2])
     if g.dtype == torch.float32 and state1.dtype == torch.uint8:
         str2optimizer8bit_blockwise[optimizer_name][0](
             get_ptr(p),
@@ -993,6 +1015,7 @@ def optimizer_update_8bit_blockwise(
         raise ValueError(
             f"Gradient+optimizer bit data type combination not supported: grad {g.dtype}, optimizer {state1.dtype}"
         )
+    post_call(prev_device)
 
 
 def percentile_clipping(
@@ -1008,6 +1031,7 @@ def percentile_clipping(
         The current optimiation steps (number of past gradient norms).
 
     """
+    prev_device = pre_call(grad.device)
     is_on_gpu([grad, gnorm_vec])
     if grad.dtype == torch.float32:
         lib.cpercentile_clipping_g32(
@@ -1025,6 +1049,7 @@ def percentile_clipping(
         )
     else:
         raise ValueError(f"Gradient type {grad.dtype} not supported!")
+    post_call(prev_device)
 
     current_gnorm = torch.sqrt(gnorm_vec[step % 100])
     vals, idx = torch.sort(gnorm_vec)
@@ -1053,7 +1078,7 @@ def histogram_scatter_add_2d(
 
     maxdim1 = ct.c_int32(histogram.shape[0])
     n = ct.c_int32(index1.numel())
-    is_on_gpu([histogram, index1, index2d, source])
+    is_on_gpu([histogram, index1, index2, source])
     lib.chistogram_scatter_add_2d(get_ptr(histogram), get_ptr(index1), get_ptr(index2), get_ptr(source), maxdim1, n)
 
 def check_matmul(A, B, out, transposed_A, transposed_B, expected_type=torch.int8):
@@ -1228,7 +1253,7 @@ def igemm(
     ptr = CUBLAS_Context.get_instance().get_context(A.device)
 
     # B^T @ A^T = C^T
-    # [km, nk -> mn] 
+    # [km, nk -> mn]
     is_on_gpu([B, A, out])
     lib.cigemm(ptr, ct.c_bool(transposed_B), ct.c_bool(transposed_A), ct.c_int32(m), ct.c_int32(n), ct.c_int32(k),
                get_ptr(B), get_ptr(A), get_ptr(out), ct.c_int32(lda), ct.c_int32(ldb), ct.c_int32(ldc))
@@ -1512,7 +1537,7 @@ def get_colrow_absmax(
     return row_stats, col_stats, nnz_block_ptr
 
 
-class COOSparseTensor(object):
+class COOSparseTensor:
     def __init__(self, rows, cols, nnz, rowidx, colidx, values):
         assert rowidx.dtype == torch.int32
         assert colidx.dtype == torch.int32
@@ -1529,7 +1554,7 @@ class COOSparseTensor(object):
         self.values = values
 
 
-class CSRSparseTensor(object):
+class CSRSparseTensor:
     def __init__(self, rows, cols, nnz, rowptr, colidx, values):
         assert rowptr.dtype == torch.int32
         assert colidx.dtype == torch.int32
@@ -1546,7 +1571,7 @@ class CSRSparseTensor(object):
         self.values = values
 
 
-class CSCSparseTensor(object):
+class CSCSparseTensor:
     def __init__(self, rows, cols, nnz, colptr, rowidx, values):
         assert colptr.dtype == torch.int32
         assert rowidx.dtype == torch.int32
@@ -1710,8 +1735,6 @@ def transform(A, to_order, from_order='row', out=None, transpose=False, state=No
         dim1 = ct.c_int32(shape[0] * shape[1])
         dim2 = ct.c_int32(shape[2])
 
-    ptrA = get_ptr(A)
-    ptrOut = get_ptr(out)
     is_on_gpu([A, out])
     if to_order == 'col32':
         if transpose:
@@ -1783,6 +1806,7 @@ def spmm_coo_very_sparse(cooA, B, dequant_stats=None, out=None):
             (cooA.rows, B.shape[1]), device=B.device, dtype=cooA.values.dtype
         )
     nnz = cooA.nnz
+    prev_device = pre_call(B.device)
     assert cooA.rowidx.numel() == nnz
     assert cooA.colidx.numel() == nnz
     assert cooA.values.numel() == nnz
@@ -1859,6 +1883,7 @@ def spmm_coo_very_sparse(cooA, B, dequant_stats=None, out=None):
             ccolsB,
         )
     # else: assertion error
+    post_call(prev_device)
 
     return out
 
