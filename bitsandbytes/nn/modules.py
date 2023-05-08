@@ -2,27 +2,17 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Iterator,
-    Mapping,
-    Optional,
-    Set,
-    Tuple,
-    TypeVar,
-    Union,
-    overload,
-)
+from typing import Optional, TypeVar, Union, overload
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, device, dtype, nn
-from torch.nn.parameter import Parameter
 
 import bitsandbytes as bnb
+import bitsandbytes.functional
+from bitsandbytes.autograd._functions import get_inverse_transform_indices, undo_layout
 from bitsandbytes.optim import GlobalOptimManager
+from bitsandbytes.utils import OutlierTracer, find_outlier_dims
 
 T = TypeVar("T", bound="torch.nn.Module")
 
@@ -38,8 +28,10 @@ class StableEmbedding(torch.nn.Embedding):
         scale_grad_by_freq: bool = False,
         sparse: bool = False,
         _weight: Optional[Tensor] = None,
+        device=None,
+        dtype=None,
     ) -> None:
-        super(StableEmbedding, self).__init__(
+        super().__init__(
             num_embeddings,
             embedding_dim,
             padding_idx,
@@ -48,8 +40,10 @@ class StableEmbedding(torch.nn.Embedding):
             scale_grad_by_freq,
             sparse,
             _weight,
+            device,
+            dtype,
         )
-        self.norm = torch.nn.LayerNorm(embedding_dim)
+        self.norm = torch.nn.LayerNorm(embedding_dim, device=device)
         GlobalOptimManager.get_instance().register_module_override(
             self, "weight", {"optim_bits": 32}
         )
@@ -81,7 +75,10 @@ class StableEmbedding(torch.nn.Embedding):
             self.sparse,
         )
 
-        return self.norm(emb)
+        # always apply layer norm in full precision
+        emb = emb.to(torch.get_default_dtype())
+
+        return self.norm(emb).to(self.weight.dtype)
 
 
 class Embedding(torch.nn.Embedding):
@@ -96,7 +93,7 @@ class Embedding(torch.nn.Embedding):
         sparse: bool = False,
         _weight: Optional[Tensor] = None,
     ) -> None:
-        super(Embedding, self).__init__(
+        super().__init__(
             num_embeddings,
             embedding_dim,
             padding_idx,
@@ -138,6 +135,34 @@ class Embedding(torch.nn.Embedding):
         )
 
         return emb
+
+class OutlierAwareLinear(nn.Linear):
+    def __init__(self, input_features, output_features, bias=True):
+        super().__init__(input_features, output_features, bias)
+        self.outlier_dim = None
+        self.is_quantized = False
+
+    def forward_with_outliers(self, x, outlier_idx):
+        raise NotImplementedError('Please override the `forward_with_outliers(self, x, outlier_idx)` function')
+
+    def quantize_weight(self, w, outlier_idx):
+        raise NotImplementedError('Please override the `quantize_weights(self, w, outlier_idx)` function')
+
+    def forward(self, x):
+        if self.outlier_dim is None:
+            tracer = OutlierTracer.get_instance()
+            if not tracer.is_initialized():
+                print('Please use OutlierTracer.initialize(model) before using the OutlierAwareLinear layer')
+            outlier_idx = tracer.get_outliers(self.weight)
+            #print(outlier_idx, tracer.get_hvalue(self.weight))
+            self.outlier_dim = outlier_idx
+
+        if not self.is_quantized:
+            w = self.quantize_weight(self.weight, self.outlier_dim)
+            self.weight.data.copy_(w)
+            self.is_quantized = True
+
+        return self.forward_with_outliers(x, self.outlier_dim)
 
 
 class Int8Params(torch.nn.Parameter):
@@ -215,6 +240,96 @@ class Int8Params(torch.nn.Parameter):
 
 
 class Linear8bitLt(nn.Linear):
+    def __init__(self, input_features, output_features, bias=True, has_fp16_weights=True,
+                       memory_efficient_backward=False, threshold=0.0, index=None):
+        super().__init__(input_features, output_features, bias)
+        assert not memory_efficient_backward, "memory_efficient_backward is no longer required and the argument is deprecated in 0.37.0 and will be removed in 0.39.0"
+        self.state = bnb.MatmulLtState()
+        self.index = index
+
+        self.state.threshold = threshold
+        self.state.has_fp16_weights = has_fp16_weights
+        self.state.memory_efficient_backward = memory_efficient_backward
+        if threshold > 0.0 and not has_fp16_weights:
+            self.state.use_pool = True
+
+        self.weight = Int8Params(self.weight.data, has_fp16_weights=has_fp16_weights, requires_grad=has_fp16_weights)
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        if not self.state.has_fp16_weights and self.state.CB is None and self.state.CxB is not None:
+            # reorder weight layout back from ampere/turing to row
+            reorder_layout = True
+            self.weight.data = self.state.CxB = undo_layout(self.state.CxB, self.state.tile_indices)
+        else:
+            reorder_layout = False
+        try:
+            super()._save_to_state_dict(destination, prefix, keep_vars)
+
+            # we only need to save SCB as extra data, because CB for quantized weights is already stored in weight.data
+            weight_name = "SCB"
+
+            # case 1: .cuda was called, SCB is in self.weight
+            param_from_weight = getattr(self.weight, weight_name)
+            # case 2: self.init_8bit_state was called, SCB is in self.state
+            param_from_state = getattr(self.state, weight_name)
+
+            key_name = prefix + f"{weight_name}"
+            if param_from_weight is not None:
+                destination[key_name] = param_from_weight if keep_vars else param_from_weight.detach()
+            elif not self.state.has_fp16_weights and param_from_state is not None:
+                destination[key_name] = param_from_state if keep_vars else param_from_state.detach()
+        finally:
+            if reorder_layout:
+                self.state.CxB, _ = bitsandbytes.functional.transform(self.state.CxB, to_order=self.state.formatB)
+                self.weight.data = self.state.CxB
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
+                                      error_msgs)
+        for key in unexpected_keys:
+            input_name = key[len(prefix):]
+            if input_name == "SCB":
+                if self.weight.SCB is None:
+                    # buffers not yet initialized, can't assign them directly without calling .cuda
+                    raise RuntimeError("Loading a quantized checkpoint into non-quantized Linear8bitLt is "
+                                       "not supported. Please call module.cuda() before module.load_state_dict()")
+
+                input_param = state_dict[key]
+                self.weight.SCB.copy_(input_param)
+                unexpected_keys.remove(key)
+                break
+        else:
+            if self.weight.SCB is not None:
+                raise RuntimeError("Loading a non-quantized checkpoint into quantized Linear8bitLt is not supported.")
+
+    def init_8bit_state(self):
+        self.state.CB = self.weight.CB
+        self.state.SCB = self.weight.SCB
+        self.weight.CB = None
+        self.weight.SCB = None
+
+    def forward(self, x: torch.Tensor):
+        self.state.is_training = self.training
+        if self.weight.CB is not None:
+            self.init_8bit_state()
+
+        # weights are cast automatically as Int8Params, but the bias has to be cast manually
+        if self.bias is not None and self.bias.dtype != x.dtype:
+            self.bias.data = self.bias.data.to(x.dtype)
+
+        out = bnb.matmul(x, self.weight, bias=self.bias, state=self.state)
+
+        if not self.state.has_fp16_weights:
+            if self.state.CB is not None and self.state.CxB is not None:
+                # we converted 8-bit row major to turing/ampere format in the first inference pass
+                # we no longer need the row-major weight
+                del self.state.CB
+                self.weight.data = self.state.CxB
+        return out
+
+
+class SwitchBackLinearBnb(nn.Linear):
     def __init__(
         self,
         input_features,
@@ -225,7 +340,7 @@ class Linear8bitLt(nn.Linear):
         threshold=0.0,
         index=None,
     ):
-        super(Linear8bitLt, self).__init__(
+        super().__init__(
             input_features, output_features, bias
         )
         self.state = bnb.MatmulLtState()
@@ -253,21 +368,4 @@ class Linear8bitLt(nn.Linear):
         if self.weight.CB is not None:
             self.init_8bit_state()
 
-        # weights are cast automatically as Int8Params, but the bias has to be cast manually
-        if self.bias is not None and self.bias.dtype != torch.float16:
-            self.bias.data = self.bias.data.half()
-
-        out = bnb.matmul(x, self.weight, bias=self.bias, state=self.state)
-
-        if not self.state.has_fp16_weights:
-            if not self.state.memory_efficient_backward and self.state.CB is not None:
-                # we converted 8-bit row major to turing/ampere format in the first inference pass
-                # we no longer need the row-major weight
-                del self.state.CB
-                self.weight.data = self.state.CxB
-            elif self.state.memory_efficient_backward and self.state.CxB is not None:
-                # For memory efficient backward, we convert 8-bit row major to turing/ampere format at each inference pass.
-                # Thus, we delete CxB from the state. 
-                del self.state.CxB
-
-        return out
+        out = bnb.matmul_mixed(x.half(), self.weight.half(), bias=None, state=self.state) + self.bias

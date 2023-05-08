@@ -1,4 +1,4 @@
-from itertools import product, permutations
+from itertools import permutations, product
 
 import pytest
 import torch
@@ -27,7 +27,7 @@ str_values = list(
     )
 )
 names = [
-    "dim1_{0}_dim2_{1}_dim3_{2}_dim4_{3}_func_{4}_dtype_{5}_requires_grad_{6}_transpose_{7}".format(
+    "dim1_{}_dim2_{}_dim3_{}_dim4_{}_func_{}_dtype_{}_requires_grad_{}_transpose_{}".format(
         *vals
     )
     for vals in str_values
@@ -239,8 +239,8 @@ dim4 = torch.randint(32, 96, size=(n,)).tolist()
 dim2.append(0)
 
 decomp = [0.0, 6.0]
-funcs = [(torch.matmul, bnb.matmul)]
-str_funcs = ["matmul"]
+funcs = [(torch.matmul, bnb.matmul), (torch.matmul, bnb.research.switchback_bnb)]
+str_funcs = ["matmullt", 'switchback_bnb']
 req_grad = [(False, False), (True, False), (True, True), (False, True)]
 req_grad = list(product([True, False], repeat=3))
 req_grad_str = []
@@ -286,7 +286,7 @@ str_values = list(
         has_bias
     )
 )
-names = ["dim1_{0}_dim2_{1}_dim3_{2}_dim4_{3}_func_{4}_dtype_{5}_requires_grad_{6}_transpose_{7}_decomp_{8}_has_fp16_weights_{9}_has_bias_{10}".format(*vals) for vals in str_values]
+names = ["dim1_{}_dim2_{}_dim3_{}_dim4_{}_func_{}_dtype_{}_requires_grad_{}_transpose_{}_decomp_{}_has_fp16_weights_{}_has_bias_{}".format(*vals) for vals in str_values]
 
 
 @pytest.mark.parametrize(
@@ -336,7 +336,7 @@ def test_matmullt(
             )
             bias = None
             bias2 = None
-            if has_bias: 
+            if has_bias:
                 bias = torch.randn(dim4, device='cuda', dtype=dtype, requires_grad=req_grad[2])
                 bias2 = bias.clone()
             torch.nn.init.xavier_uniform_(B)
@@ -429,3 +429,104 @@ def test_matmullt(
 
                 if req_grad[2]:
                     torch.testing.assert_allclose(gradBias1, gradBias2)
+
+
+
+n = 1
+k = 3
+dim1 = torch.randint(16, 64, size=(n,)).tolist()
+dim2 = torch.randint(32, 96, size=(n,)).tolist()
+dim3 = torch.randint(32, 96, size=(n,)).tolist()
+dim4 = torch.randint(32, 96, size=(n,)).tolist()
+
+dim2.append(0)
+
+funcs = [(torch.matmul, bnb.research.matmul_fp8_mixed), (torch.matmul, bnb.research.matmul_fp8_global)]
+str_funcs = ["matmul_fp8_mixed", 'matmul_fp8_global']
+req_grad = list(product([True, False], repeat=3))
+req_grad_str = []
+for c in req_grad:
+    strval = ''
+    for v in c:
+        if v == True: strval += 'T'
+        else: strval += 'F'
+    req_grad_str.append(strval)
+
+transpose = [(False, True), (False, False)]
+str_transpose = ["NT", "NN"]
+dtype = [torch.float16, torch.float32]
+has_fp16_weights = [True, False]
+values = list(product(dim1, dim2, dim3, dim4, funcs, dtype, req_grad, transpose))
+str_values = list(product(dim1, dim2, dim3, dim4, str_funcs, dtype, req_grad_str, str_transpose))
+names = ["dim1_{}_dim2_{}_dim3_{}_dim4_{}_func_{}_dtype_{}_requires_grad_{}_transpose_{}".format(*vals) for vals in str_values]
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="this test requires a GPU")
+@pytest.mark.parametrize( "dim1, dim2, dim3, dim4, funcs, dtype, req_grad, transpose", values, ids=names)
+def test_matmul_fp8( dim1, dim2, dim3, dim4, funcs, dtype, req_grad, transpose):
+    dimA = (dim2, dim3) if not transpose[0] else (dim3, dim2)
+    dimB = (dim3, dim4) if not transpose[1] else (dim4, dim3)
+    req_grad = list(req_grad)
+    req_grad[2] = False
+
+    for i in range(k):
+        # normal multiply
+        if funcs[0] in [torch.mm, torch.matmul]:
+            A = torch.randn(size=dimA, device="cuda", requires_grad=req_grad[0], dtype=dtype)
+            B = torch.randn(size=dimB, device="cuda", requires_grad=req_grad[1], dtype=dtype)
+            target = torch.randn(size=(dim2, dim4), device="cuda", requires_grad=req_grad[1], dtype=dtype)
+            torch.nn.init.xavier_uniform_(B)
+
+            fw_code = bnb.functional.create_fp8_map(True, 4, 3, 8).to(A.device)
+            bw_code = bnb.functional.create_fp8_map(True, 5, 2, 8).to(A.device)
+
+            if not transpose[0] and transpose[1]:
+                out_torch = funcs[0](A, B.t())
+                out_bnb = funcs[1](A, B.t(), fw_code, bw_code)
+            elif not transpose[0] and not transpose[1]:
+                out_torch = funcs[0](A, B)
+                out_bnb = funcs[1](A, B, fw_code, bw_code)
+
+            assert out_bnb.dtype == A.dtype, f"bnb matmullt received {A.dtype} but returned {out_bnb.dtype}"
+
+            n = out_bnb.numel()
+            err = torch.abs(out_bnb - out_torch).float().mean().item()
+            if n > 0:
+                assert err < 0.20
+            if any(req_grad):
+                out_bnb.data.copy_(out_torch)
+                torch.cuda.synchronize()
+                loss_bnb = torch.nn.functional.mse_loss(out_bnb, target).mean()
+                loss_bnb.backward()
+                gradA1 = A.grad
+                gradB1 = B.grad
+                A.grad = None
+                B.grad = None
+
+                loss_torch = torch.nn.functional.mse_loss( out_torch, target ).mean()
+                loss_torch.backward()
+                gradA2 = A.grad
+                gradB2 = B.grad
+                A.grad = None
+                B.grad = None
+
+                if req_grad[0]:
+                    torch.testing.assert_allclose( gradA1, gradA2, atol=0.015, rtol=0.1)
+
+                if req_grad[1]:
+                    n = gradB1.numel()
+                    if dim2 > 0:
+                        assert torch.abs(gradB1).sum() > 0.0
+                        assert torch.abs(gradB2).sum() > 0.0
+                    else:
+                        assert torch.abs(gradB1).sum() == 0.0
+                        assert torch.abs(gradB2).sum() == 0.0
+                    idx = torch.isclose(gradB1, gradB2, atol=0.06, rtol=0.3)
+
+                    assert (idx == 0).sum().item() <= n * 0.1
+                    idx = torch.isclose(gradB1, gradB2, atol=0.10, rtol=0.3)
+                    assert (idx == 0).sum().item() <= n * 0.02
+                    grad_err = (gradB1-gradB2).abs().mean()
+                    assert grad_err.item() < 0.003
+                    torch.testing.assert_allclose(
+                        gradB1, gradB2, atol=0.18, rtol=0.3
+                    )
+

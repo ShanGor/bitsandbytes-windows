@@ -7,7 +7,7 @@ from torch import nn
 import bitsandbytes as bnb
 
 
-class MockArgs(object):
+class MockArgs:
     def __init__(self, initial_data):
         for key in initial_data:
             setattr(self, key, initial_data[key])
@@ -15,7 +15,7 @@ class MockArgs(object):
 
 class MLP8bit(torch.nn.Module):
     def __init__(self, dim1, dim2, has_fp16_weights=True, memory_efficient_backward=False, threshold=0.0):
-        super(MLP8bit, self).__init__()
+        super().__init__()
         self.fc1 = bnb.nn.Linear8bitLt(
             dim1, dim2, has_fp16_weights=has_fp16_weights, memory_efficient_backward=memory_efficient_backward,
             threshold=threshold
@@ -289,7 +289,7 @@ class LinearFunction(torch.autograd.Function):
 
 class Linear8bit(nn.Module):
     def __init__(self, input_features, output_features, bias=True, args=None):
-        super(Linear8bit, self).__init__()
+        super().__init__()
         self.input_features = input_features
         self.output_features = output_features
         self.args = args
@@ -312,7 +312,7 @@ class Linear8bit(nn.Module):
 
 threshold = [0.0, 3.0]
 values = threshold
-names = ["threshold_{0}".format(vals) for vals in values]
+names = [f"threshold_{vals}" for vals in values]
 
 
 @pytest.mark.parametrize("threshold", values, ids=names)
@@ -378,11 +378,11 @@ def test_linear8bitlt_accumulated_gradient():
 
 threshold = [0.0, 2.0]
 values = threshold
-names = ["threshold_{0}".format(vals) for vals in values]
+names = [f"threshold_{vals}" for vals in values]
 
 
 @pytest.mark.parametrize("threshold", values, ids=names)
-@pytest.mark.parametrize("memory_efficient_backward", [True, False])
+@pytest.mark.parametrize("memory_efficient_backward", [False])
 def test_linear8bitlt_no_fp16_weights(threshold, memory_efficient_backward):
     l1 = (
         bnb.nn.Linear8bitLt(
@@ -525,3 +525,40 @@ def test_linear8bitlt_fp32_bias():
         b1 = torch.randn(16, 8, 32, device="cuda").half()
         o1 = l1(b1)
         assert l1.bias is None
+
+def test_fp8linear():
+
+    b = 10
+    h = 1024
+    inp = torch.randn(b, h).cuda()
+    fp32 = torch.nn.Linear(h, h*2).cuda()
+    fp8 = bnb.research.nn.LinearFP8Mixed(h, h*2).cuda()
+    fp32b = torch.nn.Linear(h*2, h).cuda()
+    fp8b = bnb.research.nn.LinearFP8Mixed(h*2, h).cuda()
+
+    fp8.weight.data.copy_(fp32.weight.data)
+    fp8.bias.data.copy_(fp32.bias.data)
+    fp8b.weight.data.copy_(fp32b.weight.data)
+    fp8b.bias.data.copy_(fp32b.bias.data)
+
+    a = fp32b(torch.nn.functional.gelu(fp32(inp)))
+    b = fp8b(torch.nn.functional.gelu(fp8(inp)))
+
+    err = (a-b).abs().mean()
+
+    a.mean().backward()
+    b.mean().backward()
+
+    graderr = (fp8.weight.grad-fp32.weight.grad).abs().mean()
+    bgraderr = (fp8.bias.grad-fp32.bias.grad).abs().mean()
+
+    assert err < 0.05
+    assert graderr < 0.00002
+    assert bgraderr < 0.00002
+
+
+
+
+
+
+
