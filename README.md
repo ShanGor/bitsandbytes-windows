@@ -11,6 +11,10 @@ Resources:
 
 - [note.com/kohya_ss](https://note.com/kohya_ss/n/ne17e34dd51bf)
 
+- [Issues](https://github.com/TimDettmers/bitsandbytes/issues/30)
+
+Looking for something old? [here](https://github.com/fa0311/bitsandbytes-windows/tree/legacy)
+
 ## TL;DR
 **Requirements**
 Python >=3.8. Linux distribution (Ubuntu, MacOS, etc.) + CUDA > 10.0.
