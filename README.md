@@ -1,14 +1,11 @@
-# bitsandbytes
-
-The bitsandbytes is a lightweight wrapper around CUDA custom functions, in particular 8-bit optimizers, matrix multiplication (LLM.int8()), and quantization functions.
-
+# bitsandbytes on Windows
 For Original `README`, please ref to https://github.com/TimDettmers/bitsandbytes
 
-This repo is for building it on Windows only. Changed some codes to make it work. This readme is to provide a step-by-step guide to build it on Windows.
-It is built on Visual Studio 2022 Community, and CUDA 12.1.
+This fork is for building it on Windows only. Changed some codes to make it work. This readme is to provide a step-by-step guide to build it on Windows.
+I made it successfully on Visual Studio 2022 Community, and CUDA 12.1.
 
-**Why** try to build it on Windows? Because my RTX4070 laptop version only has 8G memory. Linux cannot load the large model without enough GPU memory. But Windows has the "Shared GPU Memory" concept to share RAM to GPU, which can make our job continue.
-
+**Why** try to build it on Windows? Because my RTX4070 laptop version only has 8G memory. Linux cannot load the large model without enough GPU memory. But Windows has the "Shared GPU Memory" concept to share RAM to GPU, which can make our job continue.  
+![](windows-shared-gpu-memory.png)
 ## Comparing to Linux version, what files are changed?
 - csrc/ops.cuh: remove the `unistd.h`
 - csrc/kernals.cu:
