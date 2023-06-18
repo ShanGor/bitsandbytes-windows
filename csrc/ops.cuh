@@ -9,7 +9,12 @@
 
 #include <stdio.h>
 #include <iostream>
+
+// to exclude unistd.h for Windows
+#ifndef _MSC_VER
 #include <unistd.h>
+#endif
+
 #include <assert.h>
 
 #include <cuda_runtime_api.h>

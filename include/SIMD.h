@@ -54,6 +54,13 @@ template <> struct InstrIntTraits<SSE>
     typedef __m128i vec_t;
 };
 
+#ifdef _MSC_VER
+template <> struct InstrFloatTraits<Scalar, float>
+{
+    typedef float  vec_t;
+};
+#endif
+
 template <> struct InstrFloatTraits<SSE, float>
 {
     typedef __m128  vec_t;

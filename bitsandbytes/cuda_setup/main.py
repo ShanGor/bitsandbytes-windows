@@ -370,7 +370,7 @@ def get_compute_capability(cuda):
 
 
 def evaluate_cuda_setup():
-    return "libbitsandbytes_cuda116.dll"
+    return "libbitsandbytes_cuda121.dll"
     if 'BITSANDBYTES_NOWELCOME' not in os.environ or str(os.environ['BITSANDBYTES_NOWELCOME']) == '0':
         print('')
         print('='*35 + 'BUG REPORT' + '='*35)
